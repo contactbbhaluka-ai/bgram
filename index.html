@@ -1409,27 +1409,39 @@ function hideProgress() {
 }
 
 async function uploadImage(base64) {
-  // strip data:image/...;base64, prefix
-  const b64 = base64.split(",")[1];
-  const fd  = new FormData();
-  fd.append("key",   IMGBB_KEY);
-  fd.append("image", b64);
-  const res  = await fetch("https://api.imgbb.com/1/upload", { method:"POST", body:fd });
+  const arr  = base64.split(",");
+  const mime = arr[0].match(/:(.*?);/)[1];
+  const bstr = atob(arr[1]);
+  let n = bstr.length;
+  const u8 = new Uint8Array(n);
+  while(n--) u8[n] = bstr.charCodeAt(n);
+  const blob = new Blob([u8], { type: mime });
+  const ext  = mime.includes("png") ? "png" : mime.includes("webp") ? "webp" : mime.includes("gif") ? "gif" : "jpg";
+
+  const nonce     = Math.random().toString(36).slice(2, 12);
+  const timestamp = Math.floor(Date.now() / 1000);
+  const signature = await publitioSignature(nonce, timestamp);
+
+  const fd = new FormData();
+  fd.append("file",          blob, "image." + ext);
+  fd.append("api_key",       PUBLITIO_KEY);
+  fd.append("api_nonce",     nonce);
+  fd.append("api_timestamp", String(timestamp));
+  fd.append("api_signature", signature);
+  fd.append("privacy",       "0");
+
+  const res  = await fetch(PUBLITIO_API, { method: "POST", body: fd });
   const json = await res.json();
-  if(!json.success) throw new Error("ImgBB upload failed");
-  return { url: json.data.url, type:"image/jpeg" };
+  if(!json.success) throw new Error("Publitio image upload failed: " + (json.message || ""));
+  return { url: json.url_cdn || json.url_preview || json.public_url, type: mime };
 }
 
-// Publitio HMAC-SHA1 signature helper
+// Publitio SHA1 signature helper (timestamp + nonce + secret → SHA1 hex)
 async function publitioSignature(nonce, timestamp) {
-  const msg = timestamp + nonce + PUBLITIO_SECRET;
+  const msg = String(timestamp) + String(nonce) + String(PUBLITIO_SECRET);
   const enc = new TextEncoder();
-  const key = await crypto.subtle.importKey(
-    "raw", enc.encode(PUBLITIO_SECRET),
-    { name: "HMAC", hash: "SHA-1" }, false, ["sign"]
-  );
-  const sig = await crypto.subtle.sign("HMAC", key, enc.encode(msg));
-  return Array.from(new Uint8Array(sig)).map(b=>b.toString(16).padStart(2,"0")).join("");
+  const buf = await crypto.subtle.digest("SHA-1", enc.encode(msg));
+  return Array.from(new Uint8Array(buf)).map(b=>b.toString(16).padStart(2,"0")).join("");
 }
 
 async function uploadVideoWithProgress(entry) {
@@ -1450,17 +1462,17 @@ async function uploadVideoWithProgress(entry) {
   const ext = mime.includes("mp4") ? "mp4" : mime.includes("webm") ? "webm" : mime.includes("mov") ? "mov" : "mp4";
 
   // Publitio auth params
-  const nonce    = Math.random().toString(36).slice(2, 12);
+  const nonce     = Math.random().toString(36).slice(2, 12);
   const timestamp = Math.floor(Date.now() / 1000);
   const signature = await publitioSignature(nonce, timestamp);
 
   const fd = new FormData();
-  fd.append("file", blob, "video." + ext);
-  fd.append("api_key",   PUBLITIO_KEY);
-  fd.append("api_nonce", nonce);
-  fd.append("api_timestamp", timestamp);
+  fd.append("file",          blob, "video." + ext);
+  fd.append("api_key",       PUBLITIO_KEY);
+  fd.append("api_nonce",     nonce);
+  fd.append("api_timestamp", String(timestamp));
   fd.append("api_signature", signature);
-  fd.append("privacy", "0"); // public
+  fd.append("privacy",       "0");
 
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
@@ -1471,18 +1483,19 @@ async function uploadVideoWithProgress(entry) {
     xhr.onload = () => {
       try {
         const json = JSON.parse(xhr.responseText);
-        if(!json.success || !json.url_preview) {
+        if(!json.success) {
           reject(new Error("Publitio আপলোড ব্যর্থ: " + (json.message || xhr.responseText)));
           return;
         }
         setFileProgress(entry.id, 100);
-        // url_preview is the direct video URL
-        resolve({ url: json.url_preview, type: mime });
+        // url_cdn = direct CDN link, fallback to url_preview
+        const url = json.url_cdn || json.url_preview || json.public_url;
+        resolve({ url, type: mime });
       } catch(e) {
-        reject(new Error("Publitio রেসপন্স পার্স ব্যর্থ"));
+        reject(new Error("Publitio রেসপন্স পার্স ব্যর্থ: " + xhr.responseText));
       }
     };
-    xhr.onerror = () => reject(new Error("নেটওয়ার্ক সমস্যা"));
+    xhr.onerror = () => reject(new Error("নেটওয়ার্ক সমস্যা — Publitio সার্ভারে পৌঁছানো যাচ্ছে না"));
     xhr.send(fd);
   });
 }
@@ -2273,639 +2286,4 @@ function buildPostHTML(post){
           <button onclick="confirmDelete('${post.id}');togglePostMenu('${post.id}')" style="color:var(--danger)">🗑️ মুছুন</button>
         </div>
       </div>`:"";
-    const publicName  =post.publicName  ||post.adminName||"এডমিন";
-    const publicAvatar=post.publicAvatar!==undefined?post.publicAvatar:post.adminAvatar;
-    const postedByBadge=isAdmin&&post.adminId?(()=>{
-      const poster=admins.find(a=>a.id===post.adminId);
-      const superA=admins.find(a=>a.isSuperAdmin);
-      if(poster&&superA&&poster.id!==superA.id)
-        return `<span style="font-size:0.7rem;color:var(--text-muted);background:rgba(88,166,255,0.1);border:1px solid rgba(88,166,255,0.2);border-radius:4px;padding:1px 6px;margin-left:4px;" title="পোস্টকারী এডমিন">✍️ ${escHtml(poster.name)}</span>`;
-      return "";
-    })():"";
-    const avatarHTML=publicAvatar
-      ?`<div class="author-avatar"><img src="${publicAvatar}" alt=""></div>`
-      :`<div class="author-avatar no-img">${Array.from(publicName)[0]||"এ"}</div>`;
-    return `
-<div class="post-card${post.pinned?" pinned":""}" id="post_${post.id}">
-  ${post.pinned?`<div class="pinned-banner">📌 পিন করা পোস্ট</div>`:""}
-  <div class="post-header">
-    <div class="post-author">
-      ${avatarHTML}
-      <div class="author-info">
-        <div class="author-name">${escHtml(publicName)} <span class="blue-tick" title="ভেরিফাইড এডমিন">✓</span>${postedByBadge}</div>
-        <div class="post-time">${timeAgo(post.time)}</div>
-      </div>
-    </div>
-    <div class="post-meta-row">${adminMenu}</div>
-  </div>
-  ${captionHTML?`<div class="post-body">${captionHTML}</div>`:""}
-  ${mediaHTML}
-  <div class="post-actions">
-    <div class="reaction-row">${reactionsHTML}</div>
-    <div class="comment-row">
-      <button class="comment-toggle-btn" id="ctoggle_${post.id}" onclick="toggleComments('${post.id}')">
-        💬
-        <span id="ccount_${post.id}">${(post.comments||[]).length} মন্তব্য</span>
-        <span style="color:var(--accent2);font-size:0.78rem;">· লিখুন</span>
-        <span class="cmt-arrow">▼</span>
-      </button>
-      <button class="share-btn" id="sharebtn_${post.id}" onclick="sharePost('${post.id}')" title="শেয়ার লিংক কপি করুন" style="margin-left:auto;">
-        🔗 শেয়ার
-      </button>
-    </div>
-  </div>
-  <div class="comment-section" id="cmts_${post.id}" style="display:none">
-    <div class="comment-list" id="clist_${post.id}">${renderCommentList(post.comments, post.id)}</div>
-    <div class="comment-input-row">
-      <div class="comment-fields">
-        <input class="input-field" id="cname_${post.id}" placeholder="আপনার নাম লিখুন *" maxlength="40">
-        <textarea class="input-field" id="ctext_${post.id}" placeholder="মন্তব্য লিখুন..." rows="2" onkeydown="if(event.ctrlKey&&event.key==='Enter')submitComment('${post.id}')"></textarea>
-      </div>
-      <button class="submit-comment-btn" onclick="submitComment('${post.id}')" title="মন্তব্য পাঠান">➤</button>
-    </div>
-    <div style="font-size:0.72rem;color:var(--text-muted);margin-top:5px;text-align:right">Ctrl+Enter দিয়েও পাঠাতে পারেন</div>
-  </div>
-</div>`;
-}
-
-// ── Soft update: reactions, views, comments count only (no flicker)
-function softUpdatePost(post){
-  // View count
-  // view count disabled
-
-  // Share count
-
-
-  // Comment count & list (only if section is collapsed — open ones update via submitComment)
-  const sec=document.getElementById("cmts_"+post.id);
-  const ccount=document.getElementById("ccount_"+post.id);
-  if(ccount) ccount.textContent=(post.comments||[]).length+" মন্তব্য";
-  if(sec && sec.style.display==="none"){
-    const clist=document.getElementById("clist_"+post.id);
-    if(clist) clist.innerHTML=renderCommentList(post.comments,post.id);
-  }
-
-  // Reactions (skip if user just reacted — _reactionInProgress guard)
-  if(!_reactionInProgress){
-    const reacted=localStorage.getItem(getReactedKey(post.id));
-    const card=document.getElementById("post_"+post.id);
-    if(card) card.querySelectorAll(".reaction-btn").forEach(btn=>{
-      const btnEmoji=btn.querySelector(".emoji").textContent.trim();
-      btn.querySelector(".reaction-count").textContent=post.reactions[emojiToKey(btnEmoji)]||post.reactions[btnEmoji]||"";
-      const isActive=btnEmoji===reacted;
-      btn.classList.toggle("reacted",isActive);
-      const emojiEl=btn.querySelector(".emoji");
-      const anim=btn.dataset.anim;
-      if(isActive) emojiEl.classList.add(anim);
-      else         emojiEl.classList.remove(anim);
-    });
-  }
-
-  // Post time refresh
-  const pt=document.querySelector(`#post_${post.id} .post-time`);
-  if(pt) pt.textContent=timeAgo(post.time);
-}
-
-function renderFeed(forceFullRender){
-  // Hide skeleton on first render
-  const sk=document.getElementById("skeletonLoader");
-  if(sk) sk.style.display="none";
-
-  const feed=document.getElementById("feed");
-  const empty=document.getElementById("emptyState");
-  const filtered=getFilteredPosts();
-  updateFilterResultInfo(filtered.length,posts.length);
-
-  if(!filtered.length){
-    feed.innerHTML="";
-    if(isLoading) return;
-    empty.style.display="block";
-    if(posts.length){
-      empty.querySelector(".empty-icon").textContent="🔍";
-      empty.querySelector(".empty-title").textContent="কোনো পোস্ট পাওয়া যায়নি";
-      empty.querySelector(".empty-sub").textContent="এই সময়ের মধ্যে কোনো পোস্ট নেই";
-    } else {
-      empty.querySelector(".empty-icon").textContent="📭";
-      empty.querySelector(".empty-title").textContent="এখনো কোনো পোস্ট নেই";
-      empty.querySelector(".empty-sub").textContent="এডমিন পোস্ট করলে এখানে দেখাবে";
-    }
-    return;
-  }
-  empty.style.display="none";
-
-  // ── First load or forced full render ──
-  if(forceFullRender || !feed.querySelector(".post-card")){
-    feed.innerHTML=filtered.map(post=>buildPostHTML(post)).join("");
-    setTimeout(()=>{initAllSwipes();trackViews();},0);
-    return;
-  }
-
-  // ── Smart diff render ──
-  const existingIds=new Set([...feed.querySelectorAll(".post-card")].map(el=>el.id.replace("post_","")));
-  const filteredIds=new Set(filtered.map(p=>p.id));
-
-  // 1. Remove cards that are no longer in filtered list
-  existingIds.forEach(id=>{
-    if(!filteredIds.has(id)){
-      const el=document.getElementById("post_"+id);
-      if(el){ el.style.animation="fadeOut 0.3s ease forwards"; setTimeout(()=>el.remove(),280); }
-    }
-  });
-
-  // 2. Add new cards / soft-update existing ones
-  let prevEl=null;
-  filtered.forEach(post=>{
-    const existing=document.getElementById("post_"+post.id);
-    if(existing){
-      softUpdatePost(post);
-      prevEl=existing;
-    } else {
-      // New post — insert in correct order
-      const tmp=document.createElement("div");
-      tmp.innerHTML=buildPostHTML(post).trim();
-      const newCard=tmp.firstChild;
-      if(prevEl){
-        prevEl.insertAdjacentElement("afterend",newCard);
-      } else {
-        feed.prepend(newCard);
-      }
-      prevEl=newCard;
-      setTimeout(()=>{
-        const wrap=newCard.querySelector(".post-media[data-count]");
-        if(wrap){ goToSlide(wrap.dataset.id,0); if(parseInt(wrap.dataset.count||"1")>1&&!wrap.dataset.swipeInit){wrap.dataset.swipeInit="1";initSwipe(wrap);} }
-        trackViews();
-      },0);
-    }
-  });
-
-  // 3. Re-order DOM to match filtered array order (handles pin/unpin)
-  filtered.forEach((post,i)=>{
-    const el=document.getElementById("post_"+post.id);
-    const children=[...feed.querySelectorAll(".post-card")];
-    if(el && children[i] && children[i].id !== el.id){
-      feed.insertBefore(el, children[i]);
-    }
-  });
-}
-
-function renderMedia(post){
-  if(!post.media||!post.media.length) return "";
-  const multiple=post.media.length>1;
-  const items=post.media.map((m,i)=>{
-    if(m.type.startsWith("video"))
-      return `<div class="slide-item"><video src="${m.url}" controls playsinline></video></div>`;
-    return `<div class="slide-item"><img src="${m.url}" alt="ছবি" onclick="openLightbox('${post.id}',${i})" loading="lazy"></div>`;
-  }).join("");
-  const dots=multiple?`<div class="media-dots">${post.media.map((_,i)=>`<span class="media-dot${i===0?" active":""} dot_${post.id}"></span>`).join("")}</div>`:"";
-  const badge=multiple?`<div class="media-count-badge">1 / ${post.media.length}</div>`:"";
-  const arrows=multiple?`
-    <button class="slide-arrow prev" id="arr_prev_${post.id}" onclick="changeSlide('${post.id}',-1)" aria-label="আগের">&#8249;</button>
-    <button class="slide-arrow next" id="arr_next_${post.id}" onclick="changeSlide('${post.id}',1)"  aria-label="পরের">&#8250;</button>`:"";
-  return `<div class="post-media" id="slide_${post.id}" data-cur="0" data-count="${post.media.length}" data-id="${post.id}">
-    <div class="slides-track" id="track_${post.id}">${items}</div>${arrows}${dots}${badge}</div>`;
-}
-
-function renderCaption(text){
-  const limit=180; const safe=escHtml(text);
-  if(text.length<=limit) return `<div class="post-caption">${safe}</div>`;
-  const short=escHtml(text.slice(0,limit));
-  // Store full text safely in a data attribute to avoid newline/quote issues in onclick
-  const dataFull=safe.replace(/"/g,"&quot;");
-  return `<div class="post-caption" data-full="${dataFull}">${short}... <button class="post-caption-toggle" onclick="toggleCaption(this)">বিস্তারিত পড়ুন...</button></div>`;
-}
-function toggleCaption(btn){
-  const el=btn.parentElement;
-  const full=el.getAttribute("data-full");
-  if(full){ el.innerHTML=`<div class="post-caption">${full}</div>`; }
-}
-
-// ══════════════════════════════════════════════════════════════
-//  DRAWER
-// ══════════════════════════════════════════════════════════════
-const DRAWER_CACHE_KEY = "bb_drawer_cache";
-
-async function loadDrawerData(){
-  // Cache থেকে আগে দেখাও
-  try {
-    const raw = localStorage.getItem(DRAWER_CACHE_KEY);
-    if(raw) return JSON.parse(raw);
-  } catch(e){}
-  // Cache নেই — Firestore থেকে আনো
-  try {
-    const s=await getDoc(drawerDoc);
-    const data = s.exists()?s.data():getDefaultDrawer();
-    localStorage.setItem(DRAWER_CACHE_KEY, JSON.stringify(data));
-    return data;
-  } catch { return getDefaultDrawer(); }
-}
-function getDefaultDrawer(){ return {icon:"🌿",title:"Beautiful Bhaluka",subtitle:"কমিউনিটি ফিড",tagline:"",items:[]}; }
-async function saveDrawerData(data){
-  await setDoc(drawerDoc,data);
-  // Save করলে cache আপডেট করো
-  try { localStorage.setItem(DRAWER_CACHE_KEY, JSON.stringify(data)); } catch(e){}
-}
-
-let drawerOpen=false;
-function toggleDrawer(){ drawerOpen?closeDrawer():openDrawer(); }
-async function openDrawer(){
-  drawerOpen=true;
-  await renderDrawer();
-  document.getElementById("appDrawer").classList.add("open");
-  document.getElementById("drawerOverlay").classList.add("open");
-  document.body.style.overflow="hidden";
-}
-function closeDrawer(){
-  drawerOpen=false;
-  document.getElementById("appDrawer").classList.remove("open");
-  document.getElementById("drawerOverlay").classList.remove("open");
-  document.body.style.overflow="";
-}
-async function renderDrawer(){
-  const d=await loadDrawerData();
-  // Header logo
-  const headerIcon = document.getElementById("headerLogoIcon");
-  const headerText = document.getElementById("headerLogoText");
-  const headerSub  = document.getElementById("headerLogoSub");
-  if(headerText) headerText.textContent = d.title||"Beautiful Bhaluka";
-  if(headerSub)  headerSub.textContent  = d.subtitle||"কমিউনিটি ফিড";
-  if(headerIcon) {
-    if(d.logoImg) headerIcon.innerHTML = `<img src="${d.logoImg}" alt="logo">`;
-    else headerIcon.innerHTML = d.icon||"🔞";
-  }
-  // Logo preview in settings
-  const prev = document.getElementById("logoImgPreview");
-  if(prev) prev.innerHTML = d.logoImg?`<img src="${d.logoImg}" style="width:100%;height:100%;object-fit:contain;">`:d.icon||"🔞";
-  document.getElementById("drawerLogoIcon").textContent =d.logoImg?"":d.icon||"🔞";
-  document.getElementById("drawerLogoText").textContent =d.title||"Beautiful Bhaluka";
-  document.getElementById("drawerLogoSub").textContent  =d.subtitle||"";
-  document.getElementById("drawerTagline").textContent  =d.tagline||"";
-  document.getElementById("drawerTagline").style.display=d.tagline?"block":"none";
-  const body=document.getElementById("drawerBody");
-  if(!d.items||!d.items.length){
-    body.innerHTML=`<div style="padding:30px 20px;text-align:center;color:var(--text-muted);font-size:0.85rem;">কোনো মেনু আইটেম নেই</div>`;
-    return;
-  }
-  let html=`<div class="drawer-section-label">মেনু</div>`;
-  d.items.forEach(item=>{
-    const ext=item.target==="_blank"?`<span class="drawer-item-ext">↗</span>`:"";
-    html+=`<a class="drawer-item" href="${escHtml(item.url)}" target="${item.target||'_self'}" onclick="closeDrawer()">
-      <span class="drawer-item-icon">${item.icon||"🔗"}</span>
-      <span class="drawer-item-text">${escHtml(item.label)}</span>${ext}</a>`;
-  });
-  body.innerHTML=html;
-}
-async function saveHeaderQuick(){
-  const d = await loadDrawerData();
-  const icon  = document.getElementById("headerIconQuick").value.trim();
-  const title = document.getElementById("headerTitleQuick").value.trim();
-  const sub   = document.getElementById("headerSubQuick").value.trim();
-  if(icon)  d.icon     = icon;
-  if(title) d.title    = title;
-  if(sub!==undefined) d.subtitle = sub;
-  await saveDrawerData(d);
-  applyDrawer(d);
-  // sync to main drawer fields too
-  document.getElementById("drawerSettingIcon").value     = d.icon||"";
-  document.getElementById("drawerSettingTitle").value    = d.title||"";
-  document.getElementById("drawerSettingSubtitle").value = d.subtitle||"";
-  showToast("✅ হেডার আপডেট হয়েছে");
-}
-
-async function openDrawerSettingsTab(){
-  const d=await loadDrawerData();
-  document.getElementById("drawerSettingIcon").value    =d.icon||"";
-  document.getElementById("drawerSettingTitle").value   =d.title||"";
-  document.getElementById("drawerSettingSubtitle").value=d.subtitle||"";
-  // Quick header fields in info tab
-  const qi = document.getElementById("headerIconQuick");
-  const qt = document.getElementById("headerTitleQuick");
-  const qs = document.getElementById("headerSubQuick");
-  const qp = document.getElementById("logoImgPreviewQuick");
-  if(qi) qi.value = d.icon||"";
-  if(qt) qt.value = d.title||"";
-  if(qs) qs.value = d.subtitle||"";
-  if(qp) qp.innerHTML = d.logoImg?`<img src="${d.logoImg}" style="width:100%;height:100%;object-fit:contain;">`:d.icon||"🔞";
-  document.getElementById("drawerSettingTagline").value =d.tagline||"";
-  renderMenuItemsList();
-}
-async function saveDrawerSettings(){
-  const d=await loadDrawerData();
-  d.icon    =document.getElementById("drawerSettingIcon").value.trim()||"🌿";
-  d.title   =document.getElementById("drawerSettingTitle").value.trim()||"Beautiful Bhaluka";
-  d.subtitle=document.getElementById("drawerSettingSubtitle").value.trim();
-  d.tagline =document.getElementById("drawerSettingTagline").value.trim();
-  await saveDrawerData(d);
-  showToast("✅ ড্রয়ার হেডার সেভ হয়েছে");
-}
-async function addMenuItem(){
-  const icon  =document.getElementById("newMenuIcon").value.trim()||"🔗";
-  const label =document.getElementById("newMenuLabel").value.trim();
-  const url   =document.getElementById("newMenuUrl").value.trim()||"#";
-  const target=document.getElementById("newMenuTarget").value;
-  if(!label){showToast("⚠️ নাম / লেবেল দিন");return;}
-  const d=await loadDrawerData();
-  if(!d.items)d.items=[];
-  d.items.push({icon,label,url,target});
-  await saveDrawerData(d);
-  ["newMenuIcon","newMenuLabel","newMenuUrl"].forEach(x=>document.getElementById(x).value="");
-  renderMenuItemsList();
-  showToast("✅ মেনু আইটেম যোগ হয়েছে");
-}
-async function removeMenuItem(idx){
-  const d=await loadDrawerData();
-  d.items.splice(idx,1);
-  await saveDrawerData(d);
-  renderMenuItemsList();
-  showToast("🗑️ আইটেম সরানো হয়েছে");
-}
-async function moveMenuItem(idx,dir){
-  const d=await loadDrawerData();
-  const ni=idx+dir;
-  if(ni<0||ni>=d.items.length)return;
-  [d.items[idx],d.items[ni]]=[d.items[ni],d.items[idx]];
-  await saveDrawerData(d);
-  renderMenuItemsList();
-}
-async function renderMenuItemsList(){
-  const d=await loadDrawerData();
-  const el=document.getElementById("menuItemsList"); if(!el)return;
-  if(!d.items||!d.items.length){
-    el.innerHTML=`<div style="font-size:0.82rem;color:var(--text-muted);text-align:center;padding:10px 0;">কোনো আইটেম নেই</div>`;
-    return;
-  }
-  el.innerHTML=d.items.map((item,i)=>`
-    <div style="display:flex;align-items:center;gap:8px;background:var(--surface2);border-radius:10px;padding:9px 12px;margin-bottom:7px;">
-      <span style="font-size:1.1rem;width:24px;text-align:center;">${item.icon||"🔗"}</span>
-      <div style="flex:1;min-width:0;">
-        <div style="font-size:0.85rem;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${escHtml(item.label)}</div>
-        <div style="font-size:0.72rem;color:var(--text-muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${escHtml(item.url)}</div>
-      </div>
-      <div style="display:flex;gap:4px;flex-shrink:0;">
-        ${i>0?`<button onclick="moveMenuItem(${i},-1)" style="background:none;border:1px solid var(--border);color:var(--text-muted);width:26px;height:26px;border-radius:6px;cursor:pointer;font-size:0.8rem;">↑</button>`:""}
-        ${i<d.items.length-1?`<button onclick="moveMenuItem(${i},1)" style="background:none;border:1px solid var(--border);color:var(--text-muted);width:26px;height:26px;border-radius:6px;cursor:pointer;font-size:0.8rem;">↓</button>`:""}
-        <button onclick="removeMenuItem(${i})" style="background:rgba(248,81,73,0.15);border:1px solid rgba(248,81,73,0.3);color:var(--danger);width:26px;height:26px;border-radius:6px;cursor:pointer;font-size:0.8rem;">✕</button>
-      </div>
-    </div>`).join("");
-}
-
-// ══════════════════════════════════════════════════════════════
-//  SHARE / DEEP LINK
-// ══════════════════════════════════════════════════════════════
-function sharePost(postId) {
-  const post = posts.find(p=>p.id===postId);
-  const pNum = post && post.postNum ? post.postNum : postId;
-  const url = new URL(window.location.href);
-  url.search = "";
-  url.searchParams.set("p", pNum);
-  const link = url.toString();
-
-  const doCopy = () => {
-
-    const btn = document.getElementById("sharebtn_"+postId);
-    if(btn){ btn.innerHTML=`✅ কপি হয়েছে`; btn.classList.add("copied"); setTimeout(()=>{ btn.innerHTML=`🔗 শেয়ার`; btn.classList.remove("copied"); },2000); }
-    showToast("🔗 পারমানেন্ট লিংক কপি হয়েছে!");
-  };
-
-  if(navigator.clipboard && navigator.clipboard.writeText) {
-    navigator.clipboard.writeText(link).then(doCopy).catch(()=>{
-      const ta = document.createElement("textarea");
-      ta.value = link; ta.style.position="fixed"; ta.style.opacity="0";
-      document.body.appendChild(ta); ta.select(); document.execCommand("copy"); document.body.removeChild(ta);
-      doCopy();
-    });
-  } else {
-    const ta = document.createElement("textarea");
-    ta.value = link; ta.style.position="fixed"; ta.style.opacity="0";
-    document.body.appendChild(ta); ta.select(); document.execCommand("copy"); document.body.removeChild(ta);
-    doCopy();
-  }
-}
-
-function handleDeepLink() {
-  const params = new URLSearchParams(window.location.search);
-  const pNum = params.get("p");
-  if(!pNum) return;
-
-  // postNum দিয়ে খোঁজো
-  let post = posts.find(p => String(p.postNum) === String(pNum));
-
-  // না পেলে time-ascending order-এ index দিয়ে fallback
-  if(!post) {
-    const sorted = [...posts].sort((a,b) => new Date(a.time) - new Date(b.time));
-    const idx = parseInt(pNum) - 1;
-    if(idx >= 0 && idx < sorted.length) post = sorted[idx];
-  }
-
-  if(!post) { showToast("⚠️ পোস্টটি পাওয়া যায়নি"); return; }
-
-  const el = document.getElementById("post_" + post.id);
-  if(!el) return;
-  el.scrollIntoView({ behavior:"smooth", block:"start" });
-  el.style.outline = "2px solid var(--accent2)";
-  el.style.outlineOffset = "3px";
-  setTimeout(()=>{ el.style.outline=""; el.style.outlineOffset=""; }, 2500);
-}
-
-// ══════════════════════════════════════════════════════════════
-//  UTILS
-// ══════════════════════════════════════════════════════════════
-function escHtml(t){
-  return String(t).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/'/g,"&#39;");
-}
-function timeAgo(iso){
-  if(!iso) return "";
-  const diff=(Date.now()-new Date(iso))/1000;
-  const date=new Date(iso);
-  const monthsBn=["জানুয়ারি","ফেব্রুয়ারি","মার্চ","এপ্রিল","মে","জুন","জুলাই","আগস্ট","সেপ্টেম্বর","অক্টোবর","নভেম্বর","ডিসেম্বর"];
-  const dateStr=`${date.getDate()} ${monthsBn[date.getMonth()]} ${date.getFullYear()}`;
-  if(diff<60)    return `এইমাত্র · ${dateStr}`;
-  if(diff<3600)  return `${Math.floor(diff/60)} মিনিট আগে · ${dateStr}`;
-  if(diff<86400) return `${Math.floor(diff/3600)} ঘণ্টা আগে · ${dateStr}`;
-  if(diff<604800)return `${Math.floor(diff/86400)} দিন আগে · ${dateStr}`;
-  return dateStr;
-}
-function showToast(msg){
-  const t=document.createElement("div");t.className="toast";t.textContent=msg;
-  document.body.appendChild(t);setTimeout(()=>t.remove(),2400);
-}
-
-// ══════════════════════════════════════════════════════════════
-//  THEME
-// ══════════════════════════════════════════════════════════════
-function applyTheme(mode){
-  if(mode==="dark"){ document.documentElement.classList.add("dark"); document.documentElement.classList.remove("light"); document.getElementById("themeToggleBtn").textContent="🌙"; }
-  else             { document.documentElement.classList.remove("dark"); document.documentElement.classList.add("light"); document.getElementById("themeToggleBtn").textContent="☀️"; }
-}
-function toggleTheme(){
-  const isDark=document.documentElement.classList.contains("dark");
-  const next=isDark?"light":"dark";
-  localStorage.setItem("bb_theme",next); applyTheme(next);
-}
-applyTheme(localStorage.getItem("bb_theme")||"light");
-
-// ══════════════════════════════════════════════════════════════
-//  KEYBOARD / MODAL CLOSE
-// ══════════════════════════════════════════════════════════════
-document.querySelectorAll(".modal-overlay").forEach(el=>{
-  el.addEventListener("click",e=>{if(e.target===el)closeModal(el.id);});
-});
-document.addEventListener("keydown",e=>{
-  if(e.key==="Escape") closeLightbox();
-  if(e.key==="ArrowRight"&&lbMedia.length) lbGo(lbIdx+1);
-  if(e.key==="ArrowLeft"&&lbMedia.length)  lbGo(lbIdx-1);
-});
-
-// ══════════════════════════════════════════════════════════════
-//  EXPOSE GLOBALS (onclick= in HTML needs window scope)
-// ══════════════════════════════════════════════════════════════
-Object.assign(window,{
-  toggleDrawer,openDrawer,closeDrawer,
-  openAdminLogin,adminLogin,adminLogout,
-  openProfileModal,switchProfileTab,saveProfileInfo,handleAvatarUpload,changePassword,
-  addNewAdmin,removeAdmin,
-  openModal,closeModal,
-  openPostModal,handleMediaSelect,removeFile,submitPost,
-  confirmDelete,
-  togglePostMenu,togglePin,
-  openEditModal,removeExistingMedia,handleEditMediaSelect,renderEditNewPreviews,saveEditPost,
-  toggleReaction,
-  toggleComments,submitComment,
-  changeSlide,openLightbox,closeLightbox,lbGo,
-  setFilter,clearFilter,setTypeFilter,
-  saveDrawerSettings,addMenuItem,removeMenuItem,moveMenuItem,renderMenuItemsList,
-  toggleTheme,
-  sharePost,
-  renderFeed,
-  toggleCaption,
-
-  refreshFeed,
-});
-
-
-
-// ══════════════════════════════════════════════════════════════
-//  REFRESH FEED
-// ══════════════════════════════════════════════════════════════
-async function refreshFeed() {
-  const btn = document.getElementById("refreshFeedBtn");
-  const icon = btn ? btn.querySelector(".refresh-icon") : null;
-  if(btn) btn.disabled = true;
-  if(icon) icon.style.animation = "spin 0.7s linear infinite";
-  try {
-    const q = query(postsCol, orderBy("time","desc"));
-    const snap = await getDocs(q);
-    posts = snap.docs.map(d => {
-      const data = d.data();
-      const rawR = data.reactions||{};
-      const normR = {};
-      for(const [k,v] of Object.entries(rawR)){
-        if(/^u[0-9a-f]+/.test(k)){ normR[k]=(normR[k]||0)+v; }
-        else { const sk=emojiToKey(k); normR[sk]=(normR[sk]||0)+v; }
-      }
-      return { id:d.id, ...data, reactions:normR, time:data.time?.toDate?.()?.toISOString()||new Date().toISOString() };
-    });
-    renderFeed(true);
-    showToast("✅ ফিড আপডেট হয়েছে");
-    // cache clear করো যাতে পরের visit এ fresh data আসে
-    try { localStorage.removeItem(CACHE_KEY); } catch(e){}
-  } catch(e) {
-    showToast("❌ রিফ্রেশ ব্যর্থ হয়েছে");
-  } finally {
-    if(btn) btn.disabled = false;
-    if(icon) icon.style.animation = "";
-  }
-}
-
-// ── Back to Top scroll listener ──
-window.addEventListener("scroll", () => {
-  const btn = document.getElementById("backToTopBtn");
-  if(!btn) return;
-  if(window.scrollY > 400) btn.classList.add("visible");
-  else btn.classList.remove("visible");
-}, { passive: true });
-
-// ══════════════════════════════════════════════════════════════
-//  VISITOR COUNTER
-// ══════════════════════════════════════════════════════════════
-
-
-
-
-
-
-
-
-// ══════════════════════════════════════════════════════════════
-//  INIT — Realtime listener
-// ══════════════════════════════════════════════════════════════
-const CACHE_KEY = "bb_posts_cache";
-const CACHE_TTL = 24 * 60 * 60 * 1000; // ২৪ ঘণ্টা cache valid
-
-function normalizeDocs(docs){
-  return docs.map(d=>{
-    const data=d.data ? d.data() : d;
-    const rawR=data.reactions||{};
-    const normR={};
-    for(const [k,v] of Object.entries(rawR)){
-      if(/^u[0-9a-f]+/.test(k)){ normR[k]=(normR[k]||0)+v; }
-      else { const sk=emojiToKey(k); normR[sk]=(normR[sk]||0)+v; }
-    }
-    return { ...data, reactions:normR, time:data.time?.toDate?.()?.toISOString?.()|| data.time ||new Date().toISOString() };
-  });
-}
-
-function saveCache(data){
-  try { localStorage.setItem(CACHE_KEY, JSON.stringify({ ts: Date.now(), data })); } catch(e){}
-}
-
-function loadCache(){
-  try {
-    const raw = localStorage.getItem(CACHE_KEY);
-    if(!raw) return null;
-    const { ts, data } = JSON.parse(raw);
-    if(Date.now() - ts > CACHE_TTL) return null; // মেয়াদ শেষ
-    return data;
-  } catch(e){ return null; }
-}
-
-async function fetchFromFirestore(){
-  const q=query(postsCol, orderBy("time","desc"));
-  const snap = await getDocs(q);
-  const data = normalizeDocs(snap.docs).map((p,i)=>({ id: snap.docs[i].id, ...p }));
-  saveCache(data);
-  return data;
-}
-
-async function init(){
-  await loadAdmins();
-  const savedId=sessionStorage.getItem(SESSION_KEY);
-  if(savedId&&admins.find(a=>a.id===savedId)){ isAdmin=true; currentAdminId=savedId; }
-  updateAdminUI();
-
-  // Cache থেকে আগে দেখাও — fast load
-  const cached = loadCache();
-  if(cached){
-    posts = cached;
-    isLoading = false;
-    renderFeed(true);
-    setTimeout(handleDeepLink, 100);
-    
-    // Background এ fresh data আনো (read হবে কিন্তু user অপেক্ষা করবে না)
-    fetchFromFirestore().then(fresh=>{ posts=fresh; renderFeed(false); }).catch(()=>{});
-    return;
-  }
-
-  // Cache নেই — সরাসরি Firestore থেকে আনো
-  try {
-    posts = await fetchFromFirestore();
-  } catch(e){ posts=[]; }
-  isLoading=false;
-  renderFeed(true);
-  setTimeout(handleDeepLink, 100);
-  
-}
-init();
-</script>
-<!-- Cloudflare Web Analytics --><script defer src='https://static.cloudflareinsights.com/beacon.min.js' data-cf-beacon='{"token": "b957adbfdf09417f8b6816e2d15a16a0"}'></script><!-- End Cloudflare Web Analytics -->
-</body>
-</html>
+    const publicName  =post.publicName  ||post.adminN
